@@ -19,7 +19,7 @@ func analyzeRepository(ctx context.Context, owner, repo string, sampleSize, days
 	since := time.Now().AddDate(0, 0, -days)
 
 	// Fetch all PRs modified since the date using library function
-	prs, err := github.FetchPRsFromRepo(ctx, owner, repo, since, token, nil)
+	prs, _, err := github.FetchPRsFromRepo(ctx, owner, repo, since, token, nil)
 	if err != nil {
 		return fmt.Errorf("failed to fetch PRs: %w", err)
 	}
@@ -134,7 +134,7 @@ func analyzeOrganization(ctx context.Context, org string, sampleSize, days int, 
 	since := time.Now().AddDate(0, 0, -days)
 
 	// Fetch all PRs across the org modified since the date using library function
-	prs, err := github.FetchPRsFromOrg(ctx, org, since, token, nil)
+	prs, _, err := github.FetchPRsFromOrg(ctx, org, since, token, nil)
 	if err != nil {
 		return fmt.Errorf("failed to fetch PRs: %w", err)
 	}

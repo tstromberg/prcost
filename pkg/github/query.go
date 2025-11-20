@@ -3,6 +3,8 @@ package github
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -73,6 +75,13 @@ func IsBot(authorType, authorLogin string) bool {
 	return false
 }
 
+// QueryHash computes a SHA256 hash of a GraphQL query string for cache key generation.
+// This ensures that cache keys change when query structure changes.
+func QueryHash(query string) string {
+	hash := sha256.Sum256([]byte(query))
+	return hex.EncodeToString(hash[:8]) // Use first 8 bytes (16 hex chars) for brevity
+}
+
 // FetchPRsFromRepo queries GitHub GraphQL API for all PRs in a repository
 // modified since the specified date.
 //
@@ -92,30 +101,31 @@ func IsBot(authorType, authorLogin string) bool {
 //
 // Returns:
 //   - Slice of PRSummary for all matching PRs (deduplicated)
-func FetchPRsFromRepo(ctx context.Context, owner, repo string, since time.Time, token string, progress ProgressCallback) ([]PRSummary, error) {
+//   - Query hash for cache key generation
+func FetchPRsFromRepo(ctx context.Context, owner, repo string, since time.Time, token string, progress ProgressCallback) ([]PRSummary, string, error) {
 	// Query 1: Recent activity (updated DESC) - get up to 1000 PRs
-	recent, hitLimit, err := fetchPRsFromRepoWithSort(ctx, repoSortParams{
+	recent, hitLimit, queryHash, err := fetchPRsFromRepoWithSort(ctx, repoSortParams{
 		owner: owner, repo: repo, since: since, token: token,
 		field: "UPDATED_AT", direction: "DESC", maxPRs: 1000, queryName: "recent", progress: progress,
 	})
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	// If we didn't hit the limit, we got all PRs within the period - done!
 	if !hitLimit {
-		return recent, nil
+		return recent, queryHash, nil
 	}
 
 	// Hit limit - need more coverage for earlier periods
 	// Query 2: Old activity (updated ASC) - get ~500 more
-	old, _, err := fetchPRsFromRepoWithSort(ctx, repoSortParams{
+	old, _, _, err := fetchPRsFromRepoWithSort(ctx, repoSortParams{
 		owner: owner, repo: repo, since: since, token: token,
 		field: "UPDATED_AT", direction: "ASC", maxPRs: 500, queryName: "old", progress: progress,
 	})
 	if err != nil {
 		slog.Warn("Failed to fetch old PRs, falling back to recent only", "error", err)
-		return recent, nil
+		return recent, queryHash, nil
 	}
 
 	slog.Info("Fetched old PRs",
@@ -138,24 +148,24 @@ func FetchPRsFromRepo(ctx context.Context, owner, repo string, since time.Time, 
 			slog.Info("Gap > 1 week detected, fetching early period PRs to fill coverage hole")
 
 			// Query 3: Early period (created ASC) - get ~250 more
-			early, _, err := fetchPRsFromRepoWithSort(ctx, repoSortParams{
+			early, _, _, err := fetchPRsFromRepoWithSort(ctx, repoSortParams{
 				owner: owner, repo: repo, since: since, token: token,
 				field: "CREATED_AT", direction: "ASC", maxPRs: 250, queryName: "early", progress: progress,
 			})
 			if err != nil {
 				slog.Warn("Failed to fetch early PRs, proceeding with recent+old", "error", err)
-				return deduplicatePRs(append(recent, old...)), nil
+				return deduplicatePRs(append(recent, old...)), queryHash, nil
 			}
 
 			slog.Info("Fetched early PRs",
 				"count", len(early))
 
-			return deduplicatePRs(append(append(recent, old...), early...)), nil
+			return deduplicatePRs(append(append(recent, old...), early...)), queryHash, nil
 		}
 	}
 
 	// Gap <= 1 week or no gap to check - merge recent + old
-	return deduplicatePRs(append(recent, old...)), nil
+	return deduplicatePRs(append(recent, old...)), queryHash, nil
 }
 
 // repoSortParams contains parameters for sorted PR queries.
@@ -172,14 +182,17 @@ type repoSortParams struct {
 }
 
 // fetchPRsFromRepoWithSort queries GitHub GraphQL API with configurable sort order.
-// Returns PRs and a boolean indicating if the API limit (1000) was hit.
-func fetchPRsFromRepoWithSort(ctx context.Context, params repoSortParams) ([]PRSummary, bool, error) {
+// Returns PRs, a boolean indicating if the API limit (1000) was hit, and a query hash for caching.
+func fetchPRsFromRepoWithSort(ctx context.Context, params repoSortParams) ([]PRSummary, bool, string, error) {
 	owner, repo := params.owner, params.repo
 	since, token := params.since, params.token
 	field, direction := params.field, params.direction
 	maxPRs, queryName := params.maxPRs, params.queryName
 	progress := params.progress
-	query := fmt.Sprintf(`
+
+	// Build the GraphQL query - note we use %s placeholders for field/direction which vary
+	// but the hash is computed from the base structure to detect field changes (like adding __typename)
+	queryTemplate := `
 	query($owner: String!, $name: String!, $cursor: String) {
 		repository(owner: $owner, name: $name) {
 			pullRequests(first: 100, after: $cursor, orderBy: {field: %s, direction: %s}) {
@@ -202,7 +215,11 @@ func fetchPRsFromRepoWithSort(ctx context.Context, params repoSortParams) ([]PRS
 				}
 			}
 		}
-	}`, field, direction)
+	}`
+	query := fmt.Sprintf(queryTemplate, field, direction)
+
+	// Compute hash from the template (before field/direction substitution) to detect structural changes
+	queryHash := QueryHash(queryTemplate)
 
 	var allPRs []PRSummary
 	var cursor *string
@@ -227,13 +244,13 @@ func fetchPRsFromRepoWithSort(ctx context.Context, params repoSortParams) ([]PRS
 
 		bodyBytes, err := json.Marshal(requestBody)
 		if err != nil {
-			return nil, false, fmt.Errorf("failed to marshal request: %w", err)
+			return nil, false, "", fmt.Errorf("failed to marshal request: %w", err)
 		}
 
 		// Make GraphQL request
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.github.com/graphql", bytes.NewReader(bodyBytes))
 		if err != nil {
-			return nil, false, fmt.Errorf("failed to create request: %w", err)
+			return nil, false, "", fmt.Errorf("failed to create request: %w", err)
 		}
 
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -241,7 +258,7 @@ func fetchPRsFromRepoWithSort(ctx context.Context, params repoSortParams) ([]PRS
 
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
-			return nil, false, fmt.Errorf("failed to execute request: %w", err)
+			return nil, false, "", fmt.Errorf("failed to execute request: %w", err)
 		}
 		//nolint:revive,gocritic // defer-in-loop: proper HTTP response cleanup pattern
 		defer func() {
@@ -251,7 +268,7 @@ func fetchPRsFromRepoWithSort(ctx context.Context, params repoSortParams) ([]PRS
 		}()
 
 		if resp.StatusCode != http.StatusOK {
-			return nil, false, fmt.Errorf("GraphQL request failed with status %d", resp.StatusCode)
+			return nil, false, "", fmt.Errorf("GraphQL request failed with status %d", resp.StatusCode)
 		}
 
 		// Parse response
@@ -286,11 +303,11 @@ func fetchPRsFromRepoWithSort(ctx context.Context, params repoSortParams) ([]PRS
 		}
 
 		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			return nil, false, fmt.Errorf("failed to decode response: %w", err)
+			return nil, false, "", fmt.Errorf("failed to decode response: %w", err)
 		}
 
 		if len(result.Errors) > 0 {
-			return nil, false, fmt.Errorf("GraphQL error: %s", result.Errors[0].Message)
+			return nil, false, "", fmt.Errorf("GraphQL error: %s", result.Errors[0].Message)
 		}
 
 		totalCount := result.Data.Repository.PullRequests.TotalCount
@@ -315,7 +332,7 @@ func fetchPRsFromRepoWithSort(ctx context.Context, params repoSortParams) ([]PRS
 						"pages_fetched", pageNum,
 						"field", field,
 						"direction", direction)
-					return allPRs, hitLimit, nil
+					return allPRs, hitLimit, queryHash, nil
 				}
 				// For ASC queries, skip and continue (older PRs come first)
 				continue
@@ -340,7 +357,7 @@ func fetchPRsFromRepoWithSort(ctx context.Context, params repoSortParams) ([]PRS
 					"max_prs", maxPRs,
 					"field", field,
 					"direction", direction)
-				return allPRs, hitLimit, nil
+				return allPRs, hitLimit, queryHash, nil
 			}
 		}
 
@@ -356,7 +373,7 @@ func fetchPRsFromRepoWithSort(ctx context.Context, params repoSortParams) ([]PRS
 		cursor = &result.Data.Repository.PullRequests.PageInfo.EndCursor
 	}
 
-	return allPRs, hitLimit, nil
+	return allPRs, hitLimit, queryHash, nil
 }
 
 // deduplicatePRs removes duplicate PRs from a slice, keeping the first occurrence.
@@ -397,16 +414,17 @@ func deduplicatePRs(prs []PRSummary) []PRSummary {
 //
 // Returns:
 //   - Slice of PRSummary for all matching PRs (deduplicated)
-func FetchPRsFromOrg(ctx context.Context, org string, since time.Time, token string, progress ProgressCallback) ([]PRSummary, error) {
+//   - Query hash for cache key generation
+func FetchPRsFromOrg(ctx context.Context, org string, since time.Time, token string, progress ProgressCallback) ([]PRSummary, string, error) {
 	sinceStr := since.Format("2006-01-02")
 
 	// Query 1: Recent activity (updated desc) - get up to 1000 PRs
-	recent, hitLimit, err := fetchPRsFromOrgWithSort(ctx, orgSortParams{
+	recent, hitLimit, queryHash, err := fetchPRsFromOrgWithSort(ctx, orgSortParams{
 		org: org, sinceStr: sinceStr, token: token,
 		field: "updated", direction: "desc", maxPRs: 1000, queryName: "recent", progress: progress,
 	})
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	slog.Info("Fetched recent PRs from org",
@@ -415,18 +433,18 @@ func FetchPRsFromOrg(ctx context.Context, org string, since time.Time, token str
 
 	// If we didn't hit the limit, we got all PRs within the period - done!
 	if !hitLimit {
-		return recent, nil
+		return recent, queryHash, nil
 	}
 
 	// Hit limit - need more coverage for earlier periods
 	// Query 2: Old activity (updated asc) - get ~500 more
-	old, _, err := fetchPRsFromOrgWithSort(ctx, orgSortParams{
+	old, _, _, err := fetchPRsFromOrgWithSort(ctx, orgSortParams{
 		org: org, sinceStr: sinceStr, token: token,
 		field: "updated", direction: "asc", maxPRs: 500, queryName: "old", progress: progress,
 	})
 	if err != nil {
 		slog.Warn("Failed to fetch old PRs from org, falling back to recent only", "error", err)
-		return recent, nil
+		return recent, queryHash, nil
 	}
 
 	slog.Info("Fetched old PRs from org",
@@ -449,24 +467,24 @@ func FetchPRsFromOrg(ctx context.Context, org string, since time.Time, token str
 			slog.Info("Gap > 1 week detected, fetching early period PRs to fill coverage hole (org)")
 
 			// Query 3: Early period (created asc) - get ~250 more
-			early, _, err := fetchPRsFromOrgWithSort(ctx, orgSortParams{
+			early, _, _, err := fetchPRsFromOrgWithSort(ctx, orgSortParams{
 				org: org, sinceStr: sinceStr, token: token,
 				field: "created", direction: "asc", maxPRs: 250, queryName: "early", progress: progress,
 			})
 			if err != nil {
 				slog.Warn("Failed to fetch early PRs from org, proceeding with recent+old", "error", err)
-				return deduplicatePRsByOwnerRepoNumber(append(recent, old...)), nil
+				return deduplicatePRsByOwnerRepoNumber(append(recent, old...)), queryHash, nil
 			}
 
 			slog.Info("Fetched early PRs from org",
 				"count", len(early))
 
-			return deduplicatePRsByOwnerRepoNumber(append(append(recent, old...), early...)), nil
+			return deduplicatePRsByOwnerRepoNumber(append(append(recent, old...), early...)), queryHash, nil
 		}
 	}
 
 	// Gap <= 1 week or no gap to check - merge recent + old
-	return deduplicatePRsByOwnerRepoNumber(append(recent, old...)), nil
+	return deduplicatePRsByOwnerRepoNumber(append(recent, old...)), queryHash, nil
 }
 
 // orgSortParams contains parameters for sorted org PR queries.
@@ -482,8 +500,8 @@ type orgSortParams struct {
 }
 
 // fetchPRsFromOrgWithSort queries GitHub Search API with configurable sort order.
-// Returns PRs and a boolean indicating if the API limit (1000) was hit.
-func fetchPRsFromOrgWithSort(ctx context.Context, params orgSortParams) ([]PRSummary, bool, error) {
+// Returns PRs, a boolean indicating if the API limit (1000) was hit, and a query hash for caching.
+func fetchPRsFromOrgWithSort(ctx context.Context, params orgSortParams) ([]PRSummary, bool, string, error) {
 	org, sinceStr := params.org, params.sinceStr
 	token := params.token
 	field, direction := params.field, params.direction
@@ -493,7 +511,7 @@ func fetchPRsFromOrgWithSort(ctx context.Context, params orgSortParams) ([]PRSum
 	// Query format: org:myorg is:pr updated:>2025-07-25 sort:updated-desc
 	searchQuery := fmt.Sprintf("org:%s is:pr %s:>%s sort:%s-%s", org, field, sinceStr, field, direction)
 
-	const query = `
+	const queryTemplate = `
 	query($searchQuery: String!, $cursor: String) {
 		search(query: $searchQuery, type: ISSUE, first: 100, after: $cursor) {
 			issueCount
@@ -524,6 +542,9 @@ func fetchPRsFromOrgWithSort(ctx context.Context, params orgSortParams) ([]PRSum
 		}
 	}`
 
+	// Compute hash from the query template to detect structural changes
+	queryHash := QueryHash(queryTemplate)
+
 	var allPRs []PRSummary
 	var cursor *string
 	pageNum := 0
@@ -540,19 +561,19 @@ func fetchPRsFromOrgWithSort(ctx context.Context, params orgSortParams) ([]PRSum
 		}
 
 		requestBody := map[string]any{
-			"query":     query,
+			"query":     queryTemplate,
 			"variables": variables,
 		}
 
 		bodyBytes, err := json.Marshal(requestBody)
 		if err != nil {
-			return nil, false, fmt.Errorf("failed to marshal request: %w", err)
+			return nil, false, "", fmt.Errorf("failed to marshal request: %w", err)
 		}
 
 		// Make GraphQL request
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.github.com/graphql", bytes.NewReader(bodyBytes))
 		if err != nil {
-			return nil, false, fmt.Errorf("failed to create request: %w", err)
+			return nil, false, "", fmt.Errorf("failed to create request: %w", err)
 		}
 
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -560,7 +581,7 @@ func fetchPRsFromOrgWithSort(ctx context.Context, params orgSortParams) ([]PRSum
 
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
-			return nil, false, fmt.Errorf("failed to execute request: %w", err)
+			return nil, false, "", fmt.Errorf("failed to execute request: %w", err)
 		}
 		//nolint:revive,gocritic // defer-in-loop: proper HTTP response cleanup pattern
 		defer func() {
@@ -570,7 +591,7 @@ func fetchPRsFromOrgWithSort(ctx context.Context, params orgSortParams) ([]PRSum
 		}()
 
 		if resp.StatusCode != http.StatusOK {
-			return nil, false, fmt.Errorf("GraphQL request failed with status %d", resp.StatusCode)
+			return nil, false, "", fmt.Errorf("GraphQL request failed with status %d", resp.StatusCode)
 		}
 
 		// Parse response
@@ -607,11 +628,11 @@ func fetchPRsFromOrgWithSort(ctx context.Context, params orgSortParams) ([]PRSum
 		}
 
 		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			return nil, false, fmt.Errorf("failed to decode response: %w", err)
+			return nil, false, "", fmt.Errorf("failed to decode response: %w", err)
 		}
 
 		if len(result.Errors) > 0 {
-			return nil, false, fmt.Errorf("GraphQL error: %s", result.Errors[0].Message)
+			return nil, false, "", fmt.Errorf("GraphQL error: %s", result.Errors[0].Message)
 		}
 
 		totalCount := result.Data.Search.IssueCount
@@ -648,7 +669,7 @@ func fetchPRsFromOrgWithSort(ctx context.Context, params orgSortParams) ([]PRSum
 					"max_prs", maxPRs,
 					"field", field,
 					"direction", direction)
-				return allPRs, hitLimit, nil
+				return allPRs, hitLimit, queryHash, nil
 			}
 		}
 
@@ -664,7 +685,7 @@ func fetchPRsFromOrgWithSort(ctx context.Context, params orgSortParams) ([]PRSum
 		cursor = &result.Data.Search.PageInfo.EndCursor
 	}
 
-	return allPRs, hitLimit, nil
+	return allPRs, hitLimit, queryHash, nil
 }
 
 // deduplicatePRsByOwnerRepoNumber removes duplicate PRs from a slice using owner+repo+number as key.

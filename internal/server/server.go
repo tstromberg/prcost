@@ -1568,26 +1568,22 @@ func (s *Server) processRepoSample(ctx context.Context, req *RepoSampleRequest, 
 	// Calculate since date
 	since := time.Now().AddDate(0, 0, -req.Days)
 
-	// Try cache first
-	cacheKey := fmt.Sprintf("repo:%s/%s:days=%d", req.Owner, req.Repo, req.Days)
-	prs, cached := s.cachedPRQuery(ctx, cacheKey)
-	if cached {
-		s.logger.InfoContext(ctx, "Using cached PR query results",
-			"owner", req.Owner, "repo", req.Repo, "total_prs", len(prs))
-	} else {
-		// Fetch all PRs modified since the date
-		var err error
-		prs, err = github.FetchPRsFromRepo(ctx, req.Owner, req.Repo, since, token, nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch PRs: %w", err)
-		}
-
-		s.logger.InfoContext(ctx, "Fetched PRs from repository",
-			"owner", req.Owner, "repo", req.Repo, "total_prs", len(prs))
-
-		// Cache query results
-		s.cachePRQuery(ctx, cacheKey, prs)
+	// Fetch all PRs modified since the date (cache uses query hash internally)
+	var err error
+	var queryHash string
+	prs, queryHash, err := github.FetchPRsFromRepo(ctx, req.Owner, req.Repo, since, token, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch PRs: %w", err)
 	}
+
+	// Cache key includes query hash to invalidate when query structure changes
+	cacheKey := fmt.Sprintf("repo:%s/%s:days=%d:qh=%s", req.Owner, req.Repo, req.Days, queryHash)
+
+	s.logger.InfoContext(ctx, "Fetched PRs from repository",
+		"owner", req.Owner, "repo", req.Repo, "total_prs", len(prs), "query_hash", queryHash)
+
+	// Cache query results
+	s.cachePRQuery(ctx, cacheKey, prs)
 
 	if len(prs) == 0 {
 		return nil, fmt.Errorf("no PRs found in the last %d days", req.Days)
@@ -1704,25 +1700,21 @@ func (s *Server) processOrgSample(ctx context.Context, req *OrgSampleRequest, to
 	// Calculate since date
 	since := time.Now().AddDate(0, 0, -req.Days)
 
-	// Try cache first
-	cacheKey := fmt.Sprintf("org:%s:days=%d", req.Org, req.Days)
-	prs, cached := s.cachedPRQuery(ctx, cacheKey)
-	if cached {
-		s.logger.InfoContext(ctx, "Using cached PR query results",
-			"org", req.Org, "total_prs", len(prs))
-	} else {
-		// Fetch all PRs across the org modified since the date
-		var err error
-		prs, err = github.FetchPRsFromOrg(ctx, req.Org, since, token, nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch PRs: %w", err)
-		}
-
-		s.logger.InfoContext(ctx, "Fetched PRs from organization", "org", req.Org, "total_prs", len(prs))
-
-		// Cache query results
-		s.cachePRQuery(ctx, cacheKey, prs)
+	// Fetch all PRs across the org modified since the date (cache uses query hash internally)
+	var err error
+	var queryHash string
+	prs, queryHash, err := github.FetchPRsFromOrg(ctx, req.Org, since, token, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch PRs: %w", err)
 	}
+
+	// Cache key includes query hash to invalidate when query structure changes
+	cacheKey := fmt.Sprintf("org:%s:days=%d:qh=%s", req.Org, req.Days, queryHash)
+
+	s.logger.InfoContext(ctx, "Fetched PRs from organization", "org", req.Org, "total_prs", len(prs), "query_hash", queryHash)
+
+	// Cache query results
+	s.cachePRQuery(ctx, cacheKey, prs)
 
 	if len(prs) == 0 {
 		return nil, fmt.Errorf("no PRs found in the last %d days", req.Days)
@@ -2131,54 +2123,53 @@ func (s *Server) processRepoSampleWithProgress(ctx context.Context, req *RepoSam
 	// Calculate since date
 	since := time.Now().AddDate(0, 0, -req.Days)
 
-	// Try cache first
-	cacheKey := fmt.Sprintf("repo:%s/%s:days=%d", req.Owner, req.Repo, req.Days)
-	prs, cached := s.cachedPRQuery(ctx, cacheKey)
-	if !cached {
-		// Send progress update before GraphQL query
+	// Send progress update before GraphQL query
+	logSSEError(ctx, s.logger, sendSSE(writer, ProgressUpdate{
+		Type:     "fetching",
+		PR:       0,
+		Owner:    req.Owner,
+		Repo:     req.Repo,
+		Progress: fmt.Sprintf("Querying GitHub GraphQL API for %s/%s PRs (last %d days)...", req.Owner, req.Repo, req.Days),
+	}))
+
+	// Start keep-alive to prevent client timeout during GraphQL query
+	stopKeepAlive, connErr := startKeepAlive(writer)
+	defer close(stopKeepAlive)
+
+	// Check for connection errors in background
+	go func() {
+		if err := <-connErr; err != nil {
+			s.logger.WarnContext(ctx, "Client connection lost", errorKey, err)
+		}
+	}()
+
+	// Fetch all PRs modified since the date with progress updates
+	var err error
+	var queryHash string
+	progressCallback := func(queryName string, page int, prCount int) {
 		logSSEError(ctx, s.logger, sendSSE(writer, ProgressUpdate{
 			Type:     "fetching",
 			PR:       0,
 			Owner:    req.Owner,
 			Repo:     req.Repo,
-			Progress: fmt.Sprintf("Querying GitHub GraphQL API for %s/%s PRs (last %d days)...", req.Owner, req.Repo, req.Days),
+			Progress: fmt.Sprintf("Fetching %s PRs (page %d, %d PRs found)...", queryName, page, prCount),
 		}))
-
-		// Start keep-alive to prevent client timeout during GraphQL query
-		stopKeepAlive, connErr := startKeepAlive(writer)
-		defer close(stopKeepAlive)
-
-		// Check for connection errors in background
-		go func() {
-			if err := <-connErr; err != nil {
-				s.logger.WarnContext(ctx, "Client connection lost", errorKey, err)
-			}
-		}()
-
-		// Fetch all PRs modified since the date with progress updates
-		var err error
-		progressCallback := func(queryName string, page int, prCount int) {
-			logSSEError(ctx, s.logger, sendSSE(writer, ProgressUpdate{
-				Type:     "fetching",
-				PR:       0,
-				Owner:    req.Owner,
-				Repo:     req.Repo,
-				Progress: fmt.Sprintf("Fetching %s PRs (page %d, %d PRs found)...", queryName, page, prCount),
-			}))
-		}
-		//nolint:contextcheck // Using background context intentionally to prevent client timeout from canceling work
-		prs, err = github.FetchPRsFromRepo(workCtx, req.Owner, req.Repo, since, token, progressCallback)
-		if err != nil {
-			logSSEError(ctx, s.logger, sendSSE(writer, ProgressUpdate{
-				Type:  "error",
-				Error: fmt.Sprintf("Failed to fetch PRs: %v", err),
-			}))
-			return
-		}
-
-		// Cache query results
-		s.cachePRQuery(ctx, cacheKey, prs)
 	}
+	//nolint:contextcheck // Using background context intentionally to prevent client timeout from canceling work
+	prs, queryHash, err := github.FetchPRsFromRepo(workCtx, req.Owner, req.Repo, since, token, progressCallback)
+	if err != nil {
+		logSSEError(ctx, s.logger, sendSSE(writer, ProgressUpdate{
+			Type:  "error",
+			Error: fmt.Sprintf("Failed to fetch PRs: %v", err),
+		}))
+		return
+	}
+
+	// Cache key includes query hash to invalidate when query structure changes
+	cacheKey := fmt.Sprintf("repo:%s/%s:days=%d:qh=%s", req.Owner, req.Repo, req.Days, queryHash)
+
+	// Cache query results
+	s.cachePRQuery(ctx, cacheKey, prs)
 
 	if len(prs) == 0 {
 		logSSEError(ctx, s.logger, sendSSE(writer, ProgressUpdate{
@@ -2290,52 +2281,51 @@ func (s *Server) processOrgSampleWithProgress(ctx context.Context, req *OrgSampl
 	// Calculate since date
 	since := time.Now().AddDate(0, 0, -req.Days)
 
-	// Try cache first
-	cacheKey := fmt.Sprintf("org:%s:days=%d", req.Org, req.Days)
-	prs, cached := s.cachedPRQuery(ctx, cacheKey)
-	if !cached {
-		// Send progress update before GraphQL query
+	// Send progress update before GraphQL query
+	logSSEError(ctx, s.logger, sendSSE(writer, ProgressUpdate{
+		Type:     "fetching",
+		PR:       0,
+		Progress: fmt.Sprintf("Querying GitHub Search API for %s org PRs (last %d days)...", req.Org, req.Days),
+	}))
+
+	// Start keep-alive to prevent client timeout during GraphQL query
+	stopKeepAlive, connErr := startKeepAlive(writer)
+	defer close(stopKeepAlive)
+
+	// Check for connection errors in background
+	go func() {
+		if err := <-connErr; err != nil {
+			s.logger.WarnContext(ctx, "Client connection lost", errorKey, err)
+		}
+	}()
+
+	// Fetch all PRs across the org modified since the date with progress updates
+	var err error
+	var queryHash string
+	progressCallback := func(queryName string, page int, prCount int) {
 		logSSEError(ctx, s.logger, sendSSE(writer, ProgressUpdate{
 			Type:     "fetching",
 			PR:       0,
-			Progress: fmt.Sprintf("Querying GitHub Search API for %s org PRs (last %d days)...", req.Org, req.Days),
+			Owner:    req.Org,
+			Repo:     "",
+			Progress: fmt.Sprintf("Fetching %s PRs (page %d, %d PRs found)...", queryName, page, prCount),
 		}))
-
-		// Start keep-alive to prevent client timeout during GraphQL query
-		stopKeepAlive, connErr := startKeepAlive(writer)
-		defer close(stopKeepAlive)
-
-		// Check for connection errors in background
-		go func() {
-			if err := <-connErr; err != nil {
-				s.logger.WarnContext(ctx, "Client connection lost", errorKey, err)
-			}
-		}()
-
-		// Fetch all PRs across the org modified since the date with progress updates
-		var err error
-		progressCallback := func(queryName string, page int, prCount int) {
-			logSSEError(ctx, s.logger, sendSSE(writer, ProgressUpdate{
-				Type:     "fetching",
-				PR:       0,
-				Owner:    req.Org,
-				Repo:     "",
-				Progress: fmt.Sprintf("Fetching %s PRs (page %d, %d PRs found)...", queryName, page, prCount),
-			}))
-		}
-		//nolint:contextcheck // Using background context intentionally to prevent client timeout from canceling work
-		prs, err = github.FetchPRsFromOrg(workCtx, req.Org, since, token, progressCallback)
-		if err != nil {
-			logSSEError(ctx, s.logger, sendSSE(writer, ProgressUpdate{
-				Type:  "error",
-				Error: fmt.Sprintf("Failed to fetch PRs: %v", err),
-			}))
-			return
-		}
-
-		// Cache query results
-		s.cachePRQuery(ctx, cacheKey, prs)
 	}
+	//nolint:contextcheck // Using background context intentionally to prevent client timeout from canceling work
+	prs, queryHash, err := github.FetchPRsFromOrg(workCtx, req.Org, since, token, progressCallback)
+	if err != nil {
+		logSSEError(ctx, s.logger, sendSSE(writer, ProgressUpdate{
+			Type:  "error",
+			Error: fmt.Sprintf("Failed to fetch PRs: %v", err),
+		}))
+		return
+	}
+
+	// Cache key includes query hash to invalidate when query structure changes
+	cacheKey := fmt.Sprintf("org:%s:days=%d:qh=%s", req.Org, req.Days, queryHash)
+
+	// Cache query results
+	s.cachePRQuery(ctx, cacheKey, prs)
 
 	if len(prs) == 0 {
 		logSSEError(ctx, s.logger, sendSSE(writer, ProgressUpdate{
