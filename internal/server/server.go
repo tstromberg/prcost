@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/codeGROOVE-dev/bdcache"
+	"github.com/codeGROOVE-dev/bdcache/persist/cloudrun"
 	"github.com/codeGROOVE-dev/gsm"
 	"github.com/codeGROOVE-dev/prcost/pkg/cost"
 	"github.com/codeGROOVE-dev/prcost/pkg/github"
@@ -172,11 +173,22 @@ func New() *Server {
 
 	logger.InfoContext(ctx, "Server initialized with CSRF protection enabled")
 
+	// Get database name from environment, default to "prcost" if not set.
+	dbName := os.Getenv("DATASTORE_DB")
+	if dbName == "" {
+		dbName = "prcost"
+	}
+
 	// Initialize caches with bdcache (automatically handles memory + persistence).
-	// WithBestStore uses Cloud Datastore when K_SERVICE is set (Cloud Run/Knative), local files otherwise.
+	// cloudrun.New uses Cloud Datastore when K_SERVICE is set (Cloud Run/Knative), local files otherwise.
 	// Single unified cache with 72-hour TTL for all GitHub query results.
+	githubPersist, err := cloudrun.New[string, any](ctx, dbName)
+	if err != nil {
+		logger.ErrorContext(ctx, "Failed to initialize GitHub cache persistence", "error", err)
+		return nil
+	}
 	githubCache, err := bdcache.New[string, any](ctx,
-		bdcache.WithBestStore("prcost-github"),
+		bdcache.WithPersistence(githubPersist),
 		bdcache.WithDefaultTTL(72*time.Hour),
 		bdcache.WithMemorySize(2000),
 	)
@@ -186,8 +198,13 @@ func New() *Server {
 	}
 
 	// Separate caches for non-GitHub data with 6-day TTL
+	prDataPersist, err := cloudrun.New[string, cost.PRData](ctx, dbName)
+	if err != nil {
+		logger.ErrorContext(ctx, "Failed to initialize PR data cache persistence", "error", err)
+		return nil
+	}
 	prDataCache, err := bdcache.New[string, cost.PRData](ctx,
-		bdcache.WithBestStore("prcost-prdata"),
+		bdcache.WithPersistence(prDataPersist),
 		bdcache.WithDefaultTTL(6*24*time.Hour),
 		bdcache.WithMemorySize(1000),
 	)
@@ -196,8 +213,13 @@ func New() *Server {
 		return nil
 	}
 
+	calcResultPersist, err := cloudrun.New[string, cost.Breakdown](ctx, dbName)
+	if err != nil {
+		logger.ErrorContext(ctx, "Failed to initialize calc result cache persistence", "error", err)
+		return nil
+	}
 	calcResultCache, err := bdcache.New[string, cost.Breakdown](ctx,
-		bdcache.WithBestStore("prcost-calcresult"),
+		bdcache.WithPersistence(calcResultPersist),
 		bdcache.WithDefaultTTL(6*24*time.Hour),
 		bdcache.WithMemorySize(1000),
 	)
