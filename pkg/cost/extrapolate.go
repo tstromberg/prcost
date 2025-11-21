@@ -191,7 +191,7 @@ type ExtrapolatedBreakdown struct {
 // The function computes the average cost per PR from the samples, then multiplies
 // by the total PR count to estimate population-wide costs.
 //
-//nolint:revive,maintidx // Complex calculation function benefits from cohesion
+//nolint:revive,maintidx,gocognit // Complex calculation function benefits from cohesion
 func ExtrapolateFromSamples(breakdowns []Breakdown, totalPRs, totalAuthors, actualOpenPRs int, daysInPeriod int, cfg Config, prs []PRSummaryInfo, repoVisibility map[string]bool) ExtrapolatedBreakdown {
 	// Count unique repositories and their visibility
 	uniqueRepos := make(map[string]bool)

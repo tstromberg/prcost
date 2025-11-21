@@ -128,6 +128,7 @@ linters:
       enable-all: true
       disabled-checks:
         - paramTypeCombine
+        - rangeValCopy # PRSummary struct (152 bytes) copies are acceptable for code clarity
       # The list of supported checkers can be found at https://go-critic.com/overview.
       settings:
         captLocal:

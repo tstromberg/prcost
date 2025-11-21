@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/codeGROOVE-dev/prcost/pkg/cost"
-	"github.com/codeGROOVE-dev/prcost/pkg/github"
 )
 
 func TestNew(t *testing.T) {
@@ -603,7 +602,8 @@ func TestCachePRDataMemory(t *testing.T) {
 		CreatedAt:    time.Now(),
 	}
 
-	key := "pr:https://github.com/owner/repo/pull/123"
+	// Use unique key with timestamp to avoid collision with persisted cache
+	key := fmt.Sprintf("test-pr:https://github.com/owner/repo/pull/123:ts=%d", time.Now().UnixNano())
 
 	// Initially should not be cached
 	_, cached := s.cachedPRData(ctx, key)
@@ -625,70 +625,6 @@ func TestCachePRDataMemory(t *testing.T) {
 	}
 	if cachedData.Author != prData.Author {
 		t.Errorf("Cached Author = %s, want %s", cachedData.Author, prData.Author)
-	}
-}
-
-func TestCachePRQueryMemory(t *testing.T) {
-	s := New()
-	ctx := testContext()
-
-	prs := []github.PRSummary{
-		{Number: 123, Owner: "owner", Repo: "repo", Author: "testuser", UpdatedAt: time.Now()},
-		{Number: 456, Owner: "owner", Repo: "repo", Author: "testuser2", UpdatedAt: time.Now()},
-	}
-
-	key := "repo:owner/repo:days=30"
-
-	// Initially should not be cached
-	_, cached := s.cachedPRQuery(ctx, key)
-	if cached {
-		t.Error("PR query should not be cached initially")
-	}
-
-	// Cache the query results
-	s.cachePRQuery(ctx, key, prs)
-
-	// Should now be cached
-	cachedPRs, cached := s.cachedPRQuery(ctx, key)
-	if !cached {
-		t.Error("PR query should be cached after caching")
-	}
-
-	if len(cachedPRs) != len(prs) {
-		t.Errorf("Cached PR count = %d, want %d", len(cachedPRs), len(prs))
-	}
-	if cachedPRs[0].Number != prs[0].Number {
-		t.Errorf("Cached PR number = %d, want %d", cachedPRs[0].Number, prs[0].Number)
-	}
-}
-
-func TestCacheKeyPrefixes(t *testing.T) {
-	s := New()
-	ctx := testContext()
-
-	// Test different key prefixes
-	tests := []struct {
-		name string
-		key  string
-	}{
-		{"PR key", "pr:https://github.com/owner/repo/pull/123"},
-		{"Repo key", "repo:owner/repo:days=30"},
-		{"Org key", "org:myorg:days=90"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			prs := []github.PRSummary{{Number: 1}}
-			s.cachePRQuery(ctx, tt.key, prs)
-
-			cached, ok := s.cachedPRQuery(ctx, tt.key)
-			if !ok {
-				t.Errorf("Key %s should be cached", tt.key)
-			}
-			if len(cached) != 1 {
-				t.Errorf("Expected 1 PR, got %d", len(cached))
-			}
-		})
 	}
 }
 
@@ -2006,11 +1942,8 @@ func TestProcessRequestWithMock(t *testing.T) {
 	mockData := newMockPRData("test-author", 150, 3)
 
 	// Store in cache to simulate successful fetch
-	s.prDataCacheMu.Lock()
-	s.prDataCache["https://github.com/test/repo/pull/123"] = &cacheEntry{
-		data: mockData,
-	}
-	s.prDataCacheMu.Unlock()
+	//nolint:errcheck // test setup - errors don't matter
+	_ = s.prDataCache.Set(ctx, "https://github.com/test/repo/pull/123", *mockData, 0)
 
 	req := &CalculateRequest{
 		URL: "https://github.com/test/repo/pull/123",
@@ -2025,50 +1958,15 @@ func TestProcessRequestWithMock(t *testing.T) {
 	_ = err
 }
 
-func TestCachedPRQueryHit(t *testing.T) {
-	s := New()
-	ctx := context.Background()
-
-	// Pre-populate cache
-	testPRs := newMockPRSummaries(5)
-	key := "repo:owner/repo:30"
-
-	s.prQueryCacheMu.Lock()
-	s.prQueryCache[key] = &cacheEntry{data: testPRs}
-	s.prQueryCacheMu.Unlock()
-
-	// Test cache hit
-	prs, found := s.cachedPRQuery(ctx, key)
-	if !found {
-		t.Error("Expected cache hit")
-	}
-	if len(prs) != 5 {
-		t.Errorf("Expected 5 PRs, got %d", len(prs))
-	}
-}
-
-func TestCachedPRQueryMiss(t *testing.T) {
-	s := New()
-	ctx := context.Background()
-
-	// Test cache miss
-	_, found := s.cachedPRQuery(ctx, "nonexistent-key")
-	if found {
-		t.Error("Expected cache miss")
-	}
-}
-
 func TestCachedPRDataHit(t *testing.T) {
 	s := New()
 	ctx := context.Background()
 
-	// Pre-populate cache
+	// Pre-populate cache using the cache method (which sanitizes keys)
 	testData := newMockPRData("test-author", 100, 5)
 	key := "https://github.com/owner/repo/pull/123"
 
-	s.prDataCacheMu.Lock()
-	s.prDataCache[key] = &cacheEntry{data: *testData}
-	s.prDataCacheMu.Unlock()
+	s.cachePRData(ctx, key, *testData)
 
 	// Test cache hit
 	data, found := s.cachedPRData(ctx, key)
@@ -2077,34 +1975,6 @@ func TestCachedPRDataHit(t *testing.T) {
 	}
 	if data.Author != "test-author" {
 		t.Errorf("Expected author test-author, got %s", data.Author)
-	}
-}
-
-func TestCachePRQuery(t *testing.T) {
-	s := New()
-	ctx := context.Background()
-
-	testPRs := newMockPRSummaries(3)
-	key := "repo:owner/repo:30"
-
-	// Cache the data
-	s.cachePRQuery(ctx, key, testPRs)
-
-	// Verify it was cached
-	s.prQueryCacheMu.RLock()
-	entry, exists := s.prQueryCache[key]
-	s.prQueryCacheMu.RUnlock()
-
-	if !exists {
-		t.Error("Expected data to be cached")
-	}
-
-	if cached, ok := entry.data.([]github.PRSummary); ok {
-		if len(cached) != 3 {
-			t.Errorf("Expected 3 cached PRs, got %d", len(cached))
-		}
-	} else {
-		t.Error("Cached data is not []github.PRSummary")
 	}
 }
 
@@ -2118,24 +1988,18 @@ func TestCachePRData(t *testing.T) {
 	// Cache the data
 	s.cachePRData(ctx, key, *testData)
 
-	// Verify it was cached
-	s.prDataCacheMu.RLock()
-	entry, exists := s.prDataCache[key]
-	s.prDataCacheMu.RUnlock()
+	// Verify it was cached by retrieving it via the cache method
+	cached, found := s.cachedPRData(ctx, key)
 
-	if !exists {
+	if !found {
 		t.Error("Expected data to be cached")
 	}
 
-	if cached, ok := entry.data.(cost.PRData); ok {
-		if cached.Author != "author" {
-			t.Errorf("Expected author 'author', got %s", cached.Author)
-		}
-		if cached.LinesAdded != 200 {
-			t.Errorf("Expected 200 lines, got %d", cached.LinesAdded)
-		}
-	} else {
-		t.Error("Cached data is not cost.PRData")
+	if cached.Author != "author" {
+		t.Errorf("Expected author 'author', got %s", cached.Author)
+	}
+	if cached.LinesAdded != 200 {
+		t.Errorf("Expected 200 lines, got %d", cached.LinesAdded)
 	}
 }
 
@@ -2559,24 +2423,6 @@ func TestSanitizeErrorWithTokens(t *testing.T) {
 	}
 }
 
-func TestCachePRQueryMemoryWrite(t *testing.T) {
-	s := New()
-	ctx := context.Background()
-	testPRs := newMockPRSummaries(3)
-	key := "test-cache-key"
-
-	s.cachePRQuery(ctx, key, testPRs)
-
-	// Verify it was cached in memory
-	prs, found := s.cachedPRQuery(ctx, key)
-	if !found {
-		t.Fatal("Expected cache entry to be found")
-	}
-	if len(prs) != 3 {
-		t.Errorf("Expected 3 PRs, got %d", len(prs))
-	}
-}
-
 func TestCachePRDataMemoryWrite(t *testing.T) {
 	s := New()
 	ctx := context.Background()
@@ -2608,37 +2454,8 @@ func TestCachedPRDataMissCache(t *testing.T) {
 	}
 }
 
-func TestCachedPRQueryBadType(t *testing.T) {
-	s := New()
-	ctx := context.Background()
-	key := "bad-type-key"
-
-	// Store wrong type in cache
-	s.prQueryCacheMu.Lock()
-	s.prQueryCache[key] = &cacheEntry{data: "not a PR summary slice"}
-	s.prQueryCacheMu.Unlock()
-
-	_, found := s.cachedPRQuery(ctx, key)
-	if found {
-		t.Error("Expected cache miss for wrong type")
-	}
-}
-
-func TestCachedPRDataBadType(t *testing.T) {
-	s := New()
-	ctx := context.Background()
-	key := "bad-type-key"
-
-	// Store wrong type in cache
-	s.prDataCacheMu.Lock()
-	s.prDataCache[key] = &cacheEntry{data: "not a PRData"}
-	s.prDataCacheMu.Unlock()
-
-	_, found := s.cachedPRData(ctx, key)
-	if found {
-		t.Error("Expected cache miss for wrong type")
-	}
-}
+// TestCachedPRQueryBadType and TestCachedPRDataBadType removed:
+// bdcache uses generic types, so type mismatches are impossible at compile time.
 
 func TestLimiterCleanupLarge(t *testing.T) {
 	s := New()

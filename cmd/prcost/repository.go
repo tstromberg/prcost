@@ -15,11 +15,14 @@ import (
 // Uses library functions from pkg/github and pkg/cost for fetching, sampling,
 // and extrapolation - all functionality is available to external clients.
 func analyzeRepository(ctx context.Context, owner, repo string, sampleSize, days int, cfg cost.Config, token, dataSource string) error {
+	// Create GitHub client without caching (for CLI)
+	client := github.NewClientWithoutCache()
+
 	// Calculate since date
 	since := time.Now().AddDate(0, 0, -days)
 
 	// Fetch all PRs modified since the date using library function
-	prs, _, err := github.FetchPRsFromRepo(ctx, owner, repo, since, token, nil)
+	prs, err := client.FetchPRsFromRepo(ctx, owner, repo, since, token, nil)
 	if err != nil {
 		return fmt.Errorf("failed to fetch PRs: %w", err)
 	}
@@ -93,7 +96,7 @@ func analyzeRepository(ctx context.Context, owner, repo string, sampleSize, days
 	totalAuthors := github.CountUniqueAuthors(prs)
 
 	// Query for actual count of open PRs (not extrapolated from samples)
-	openPRCount, err := github.CountOpenPRsInRepo(ctx, owner, repo, token)
+	openPRCount, err := client.CountOpenPRsInRepo(ctx, owner, repo, token)
 	if err != nil {
 		slog.Warn("Failed to count open PRs, using 0", "error", err)
 		openPRCount = 0
@@ -128,13 +131,16 @@ func analyzeRepository(ctx context.Context, owner, repo string, sampleSize, days
 // Uses library functions from pkg/github and pkg/cost for fetching, sampling,
 // and extrapolation - all functionality is available to external clients.
 func analyzeOrganization(ctx context.Context, org string, sampleSize, days int, cfg cost.Config, token, dataSource string) error {
+	// Create GitHub client without caching (for CLI)
+	client := github.NewClientWithoutCache()
+
 	slog.Info("Fetching PR list from organization")
 
 	// Calculate since date
 	since := time.Now().AddDate(0, 0, -days)
 
 	// Fetch all PRs across the org modified since the date using library function
-	prs, _, err := github.FetchPRsFromOrg(ctx, org, since, token, nil)
+	prs, err := client.FetchPRsFromOrg(ctx, org, since, token, nil)
 	if err != nil {
 		return fmt.Errorf("failed to fetch PRs: %w", err)
 	}
@@ -208,7 +214,7 @@ func analyzeOrganization(ctx context.Context, org string, sampleSize, days int, 
 	totalAuthors := github.CountUniqueAuthors(prs)
 
 	// Count open PRs across the entire organization with a single query
-	totalOpenPRs, err := github.CountOpenPRsInOrg(ctx, org, token)
+	totalOpenPRs, err := client.CountOpenPRsInOrg(ctx, org, token)
 	if err != nil {
 		slog.Warn("Failed to count open PRs in organization, using 0", "error", err)
 		totalOpenPRs = 0

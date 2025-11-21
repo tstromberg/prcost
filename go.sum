@@ -1,5 +1,9 @@
+github.com/codeGROOVE-dev/bdcache v0.5.0 h1:62Ns4QOdZ239LtytJDcO+kI4OOr+5SPh/ct81rGEEtY=
+github.com/codeGROOVE-dev/bdcache v0.5.0/go.mod h1:vZlNyKt4Zmse37T9wPZX+J3Kc2fjZlcGzXArQh5W4dc=
 github.com/codeGROOVE-dev/ds9 v0.6.0 h1:JG7vBH17UAKaVoeQilrIvA1I0fg3iNbdUMBSDS7ixgI=
 github.com/codeGROOVE-dev/ds9 v0.6.0/go.mod h1:0UDipxF1DADfqM5GtjefgB2u+EXdDgOKmxVvrSGLHoM=
+github.com/codeGROOVE-dev/ds9 v0.7.1 h1:UuffbTksanUPERBkOsiPOe46fkTJlzBOA9jUyfkBxEI=
+github.com/codeGROOVE-dev/ds9 v0.7.1/go.mod h1:0UDipxF1DADfqM5GtjefgB2u+EXdDgOKmxVvrSGLHoM=
 github.com/codeGROOVE-dev/gsm v0.0.0-20251019065141-833fe2363d22 h1:gtN3rOc6YspO646BkcOxBhPjEqKUz+jl175jIqglfDg=
 github.com/codeGROOVE-dev/gsm v0.0.0-20251019065141-833fe2363d22/go.mod h1:KV+w19ubP32PxZPE1hOtlCpTaNpF0Bpb32w5djO8UTg=
 github.com/codeGROOVE-dev/prx v0.0.0-20251030022101-ff906928a1e4 h1:DSuoUwP3oyR4cHrX0cUh9c7CtYjXNIcyCmqpIwHilIU=

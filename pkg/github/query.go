@@ -10,9 +10,40 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
+
+// Cache is a simple interface for caching any type of data.
+// The server provides this via bdcache, with proper TTLs for each data type.
+type Cache interface {
+	Get(ctx context.Context, key string) (any, bool)
+	Set(ctx context.Context, key string, value any)
+}
+
+// Client provides cached access to GitHub GraphQL APIs.
+type Client struct {
+	cache Cache
+}
+
+// NewClient creates a GitHub client with caching.
+// If cache is nil, caching is disabled (queries will always hit GitHub).
+func NewClient(cache Cache) *Client {
+	return &Client{cache: cache}
+}
+
+// noopCache implements Cache but never caches anything.
+type noopCache struct{}
+
+func (noopCache) Get(context.Context, string) (any, bool) { return nil, false }
+func (noopCache) Set(context.Context, string, any)        {}
+
+// NewClientWithoutCache creates a GitHub client that never caches.
+// Use this for CLI tools or one-off queries.
+func NewClientWithoutCache() *Client {
+	return &Client{cache: noopCache{}}
+}
 
 // PRSummary holds minimal information about a PR for sampling and fetching.
 type PRSummary struct {
@@ -82,7 +113,33 @@ func QueryHash(query string) string {
 	return hex.EncodeToString(hash[:8]) // Use first 8 bytes (16 hex chars) for brevity
 }
 
-// FetchPRsFromRepo queries GitHub GraphQL API for all PRs in a repository
+// CacheKey generates a cache key from a GraphQL query template and its parameters.
+// The key includes a hash of the query text so cache is invalidated when the query changes.
+//
+// Parameters:
+//   - queryTemplate: The GraphQL query text (can include %s placeholders before fmt.Sprintf)
+//   - params: Key-value pairs describing the query parameters (e.g., "org", "myorg", "days", "30")
+//
+// Returns: A cache key like "org=myorg:days=30:qh=a1b2c3d4".
+func CacheKey(queryTemplate string, params ...string) string {
+	if len(params)%2 != 0 {
+		panic("CacheKey requires even number of params (key-value pairs)")
+	}
+
+	// Build parameter portion of cache key
+	var keyParts []string
+	for i := 0; i < len(params); i += 2 {
+		keyParts = append(keyParts, fmt.Sprintf("%s=%v", params[i], params[i+1]))
+	}
+
+	// Add query hash to invalidate cache when query structure changes
+	queryHash := QueryHash(queryTemplate)
+	keyParts = append(keyParts, fmt.Sprintf("qh=%s", queryHash))
+
+	return strings.Join(keyParts, ":")
+}
+
+// FetchPRsFromRepo queries GitHub GraphQL API (with caching) for all PRs in a repository
 // modified since the specified date.
 //
 // Uses an adaptive multi-query strategy for comprehensive time coverage:
@@ -90,42 +147,81 @@ func QueryHash(query string) string {
 //  2. If hit limit, query old activity (updated ASC) - get ~500 more
 //  3. Check gap between oldest "recent" and newest "old"
 //  4. If gap > 1 week, query early period (created ASC) - get ~250 more
-//
-// Parameters:
-//   - ctx: Context for the API call
-//   - owner: GitHub repository owner
-//   - repo: GitHub repository name
-//   - since: Only include PRs updated after this time
-//   - token: GitHub authentication token
-//   - progress: Optional callback for progress updates (can be nil)
-//
-// Returns:
-//   - Slice of PRSummary for all matching PRs (deduplicated)
-//   - Query hash for cache key generation
-func FetchPRsFromRepo(ctx context.Context, owner, repo string, since time.Time, token string, progress ProgressCallback) ([]PRSummary, string, error) {
+func (c *Client) FetchPRsFromRepo(
+	ctx context.Context, owner, repo string, since time.Time, token string, progress ProgressCallback,
+) ([]PRSummary, error) {
+	// Define query template for cache key
+	queryTemplate := `
+	query($owner: String!, $name: String!, $cursor: String) {
+		repository(owner: $owner, name: $name) {
+			pullRequests(first: 100, after: $cursor, orderBy: {field: %s, direction: %s}) {
+				totalCount
+				pageInfo {
+					hasNextPage
+					endCursor
+				}
+				nodes {
+					number
+					createdAt
+					updatedAt
+					closedAt
+					state
+					merged
+					author {
+						login
+						__typename
+					}
+				}
+			}
+		}
+	}`
+
+	days := int(time.Since(since).Hours() / 24)
+	cacheKey := CacheKey(queryTemplate, "owner", owner, "repo", repo, "days", strconv.Itoa(days))
+
+	// Check cache
+	if cached, found := c.cache.Get(ctx, cacheKey); found {
+		if prs, ok := cached.([]PRSummary); ok {
+			return prs, nil
+		}
+	}
+
+	// Cache miss - fetch from GitHub
+	prs, err := fetchPRsFromRepo(ctx, owner, repo, since, token, progress)
+	if err != nil {
+		return nil, err
+	}
+
+	// Store in cache
+	c.cache.Set(ctx, cacheKey, prs)
+	return prs, nil
+}
+
+// fetchPRsFromRepo is the internal implementation.
+func fetchPRsFromRepo(ctx context.Context, owner, repo string, since time.Time, token string, progress ProgressCallback) ([]PRSummary, error) {
 	// Query 1: Recent activity (updated DESC) - get up to 1000 PRs
-	recent, hitLimit, queryHash, err := fetchPRsFromRepoWithSort(ctx, repoSortParams{
+	recent, hitLimit, err := fetchPRsFromRepoWithSort(ctx, repoSortParams{
 		owner: owner, repo: repo, since: since, token: token,
 		field: "UPDATED_AT", direction: "DESC", maxPRs: 1000, queryName: "recent", progress: progress,
 	})
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 
 	// If we didn't hit the limit, we got all PRs within the period - done!
 	if !hitLimit {
-		return recent, queryHash, nil
+		return recent, nil
 	}
 
 	// Hit limit - need more coverage for earlier periods
 	// Query 2: Old activity (updated ASC) - get ~500 more
-	old, _, _, err := fetchPRsFromRepoWithSort(ctx, repoSortParams{
+	old, _, err := fetchPRsFromRepoWithSort(ctx, repoSortParams{
 		owner: owner, repo: repo, since: since, token: token,
 		field: "UPDATED_AT", direction: "ASC", maxPRs: 500, queryName: "old", progress: progress,
 	})
 	if err != nil {
 		slog.Warn("Failed to fetch old PRs, falling back to recent only", "error", err)
-		return recent, queryHash, nil
+		return recent, nil
 	}
 
 	slog.Info("Fetched old PRs",
@@ -148,24 +244,24 @@ func FetchPRsFromRepo(ctx context.Context, owner, repo string, since time.Time, 
 			slog.Info("Gap > 1 week detected, fetching early period PRs to fill coverage hole")
 
 			// Query 3: Early period (created ASC) - get ~250 more
-			early, _, _, err := fetchPRsFromRepoWithSort(ctx, repoSortParams{
+			early, _, err := fetchPRsFromRepoWithSort(ctx, repoSortParams{
 				owner: owner, repo: repo, since: since, token: token,
 				field: "CREATED_AT", direction: "ASC", maxPRs: 250, queryName: "early", progress: progress,
 			})
 			if err != nil {
 				slog.Warn("Failed to fetch early PRs, proceeding with recent+old", "error", err)
-				return deduplicatePRs(append(recent, old...)), queryHash, nil
+				return deduplicatePRs(append(recent, old...)), nil
 			}
 
 			slog.Info("Fetched early PRs",
 				"count", len(early))
 
-			return deduplicatePRs(append(append(recent, old...), early...)), queryHash, nil
+			return deduplicatePRs(append(append(recent, old...), early...)), nil
 		}
 	}
 
 	// Gap <= 1 week or no gap to check - merge recent + old
-	return deduplicatePRs(append(recent, old...)), queryHash, nil
+	return deduplicatePRs(append(recent, old...)), nil
 }
 
 // repoSortParams contains parameters for sorted PR queries.
@@ -183,7 +279,9 @@ type repoSortParams struct {
 
 // fetchPRsFromRepoWithSort queries GitHub GraphQL API with configurable sort order.
 // Returns PRs, a boolean indicating if the API limit (1000) was hit, and a query hash for caching.
-func fetchPRsFromRepoWithSort(ctx context.Context, params repoSortParams) ([]PRSummary, bool, string, error) {
+func fetchPRsFromRepoWithSort(
+	ctx context.Context, params repoSortParams,
+) (prs []PRSummary, hitLimit bool, err error) {
 	owner, repo := params.owner, params.repo
 	since, token := params.since, params.token
 	field, direction := params.field, params.direction
@@ -218,13 +316,10 @@ func fetchPRsFromRepoWithSort(ctx context.Context, params repoSortParams) ([]PRS
 	}`
 	query := fmt.Sprintf(queryTemplate, field, direction)
 
-	// Compute hash from the template (before field/direction substitution) to detect structural changes
-	queryHash := QueryHash(queryTemplate)
-
 	var allPRs []PRSummary
 	var cursor *string
 	pageNum := 0
-	hitLimit := false
+	hitLimit = false
 
 	for {
 		pageNum++
@@ -244,13 +339,13 @@ func fetchPRsFromRepoWithSort(ctx context.Context, params repoSortParams) ([]PRS
 
 		bodyBytes, err := json.Marshal(requestBody)
 		if err != nil {
-			return nil, false, "", fmt.Errorf("failed to marshal request: %w", err)
+			return nil, false, fmt.Errorf("failed to marshal request: %w", err)
 		}
 
 		// Make GraphQL request
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.github.com/graphql", bytes.NewReader(bodyBytes))
 		if err != nil {
-			return nil, false, "", fmt.Errorf("failed to create request: %w", err)
+			return nil, false, fmt.Errorf("failed to create request: %w", err)
 		}
 
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -258,7 +353,7 @@ func fetchPRsFromRepoWithSort(ctx context.Context, params repoSortParams) ([]PRS
 
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
-			return nil, false, "", fmt.Errorf("failed to execute request: %w", err)
+			return nil, false, fmt.Errorf("failed to execute request: %w", err)
 		}
 		//nolint:revive,gocritic // defer-in-loop: proper HTTP response cleanup pattern
 		defer func() {
@@ -268,7 +363,7 @@ func fetchPRsFromRepoWithSort(ctx context.Context, params repoSortParams) ([]PRS
 		}()
 
 		if resp.StatusCode != http.StatusOK {
-			return nil, false, "", fmt.Errorf("GraphQL request failed with status %d", resp.StatusCode)
+			return nil, false, fmt.Errorf("GraphQL request failed with status %d", resp.StatusCode)
 		}
 
 		// Parse response
@@ -303,11 +398,11 @@ func fetchPRsFromRepoWithSort(ctx context.Context, params repoSortParams) ([]PRS
 		}
 
 		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			return nil, false, "", fmt.Errorf("failed to decode response: %w", err)
+			return nil, false, fmt.Errorf("failed to decode response: %w", err)
 		}
 
 		if len(result.Errors) > 0 {
-			return nil, false, "", fmt.Errorf("GraphQL error: %s", result.Errors[0].Message)
+			return nil, false, fmt.Errorf("GraphQL error: %s", result.Errors[0].Message)
 		}
 
 		totalCount := result.Data.Repository.PullRequests.TotalCount
@@ -332,7 +427,7 @@ func fetchPRsFromRepoWithSort(ctx context.Context, params repoSortParams) ([]PRS
 						"pages_fetched", pageNum,
 						"field", field,
 						"direction", direction)
-					return allPRs, hitLimit, queryHash, nil
+					return allPRs, hitLimit, nil
 				}
 				// For ASC queries, skip and continue (older PRs come first)
 				continue
@@ -357,7 +452,7 @@ func fetchPRsFromRepoWithSort(ctx context.Context, params repoSortParams) ([]PRS
 					"max_prs", maxPRs,
 					"field", field,
 					"direction", direction)
-				return allPRs, hitLimit, queryHash, nil
+				return allPRs, hitLimit, nil
 			}
 		}
 
@@ -373,7 +468,7 @@ func fetchPRsFromRepoWithSort(ctx context.Context, params repoSortParams) ([]PRS
 		cursor = &result.Data.Repository.PullRequests.PageInfo.EndCursor
 	}
 
-	return allPRs, hitLimit, queryHash, nil
+	return allPRs, hitLimit, nil
 }
 
 // deduplicatePRs removes duplicate PRs from a slice, keeping the first occurrence.
@@ -396,7 +491,7 @@ func deduplicatePRs(prs []PRSummary) []PRSummary {
 	return unique
 }
 
-// FetchPRsFromOrg queries GitHub GraphQL Search API for all PRs across
+// FetchPRsFromOrg queries GitHub GraphQL Search API (with caching) for all PRs across
 // an organization modified since the specified date.
 //
 // Uses an adaptive multi-query strategy for comprehensive time coverage:
@@ -404,27 +499,71 @@ func deduplicatePRs(prs []PRSummary) []PRSummary {
 //  2. If hit limit, query old activity (updated asc) - get ~500 more
 //  3. Check gap between oldest "recent" and newest "old"
 //  4. If gap > 1 week, query early period (created asc) - get ~250 more
-//
-// Parameters:
-//   - ctx: Context for the API call
-//   - org: GitHub organization name
-//   - since: Only include PRs updated after this time
-//   - token: GitHub authentication token
-//   - progress: Optional callback for progress updates (can be nil)
-//
-// Returns:
-//   - Slice of PRSummary for all matching PRs (deduplicated)
-//   - Query hash for cache key generation
-func FetchPRsFromOrg(ctx context.Context, org string, since time.Time, token string, progress ProgressCallback) ([]PRSummary, string, error) {
+func (c *Client) FetchPRsFromOrg(ctx context.Context, org string, since time.Time, token string, progress ProgressCallback) ([]PRSummary, error) {
+	// Define query template for cache key
+	queryTemplate := `
+	query($searchQuery: String!, $cursor: String) {
+		search(query: $searchQuery, type: ISSUE, first: 100, after: $cursor) {
+			issueCount
+			pageInfo {
+				hasNextPage
+				endCursor
+			}
+			nodes {
+				... on PullRequest {
+					number
+					createdAt
+					updatedAt
+					closedAt
+					state
+					merged
+					author {
+						login
+						__typename
+					}
+					repository {
+						owner {
+							login
+						}
+						name
+					}
+				}
+			}
+		}
+	}`
+
+	days := int(time.Since(since).Hours() / 24)
+	cacheKey := CacheKey(queryTemplate, "org", org, "days", strconv.Itoa(days))
+
+	// Check cache
+	if cached, found := c.cache.Get(ctx, cacheKey); found {
+		if prs, ok := cached.([]PRSummary); ok {
+			return prs, nil
+		}
+	}
+
+	// Cache miss - fetch from GitHub
+	prs, err := fetchPRsFromOrg(ctx, org, since, token, progress)
+	if err != nil {
+		return nil, err
+	}
+
+	// Store in cache
+	c.cache.Set(ctx, cacheKey, prs)
+	return prs, nil
+}
+
+// fetchPRsFromOrg is the internal implementation.
+func fetchPRsFromOrg(ctx context.Context, org string, since time.Time, token string, progress ProgressCallback) ([]PRSummary, error) {
 	sinceStr := since.Format("2006-01-02")
 
 	// Query 1: Recent activity (updated desc) - get up to 1000 PRs
-	recent, hitLimit, queryHash, err := fetchPRsFromOrgWithSort(ctx, orgSortParams{
+	recent, hitLimit, err := fetchPRsFromOrgWithSort(ctx, orgSortParams{
 		org: org, sinceStr: sinceStr, token: token,
 		field: "updated", direction: "desc", maxPRs: 1000, queryName: "recent", progress: progress,
 	})
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 
 	slog.Info("Fetched recent PRs from org",
@@ -433,18 +572,18 @@ func FetchPRsFromOrg(ctx context.Context, org string, since time.Time, token str
 
 	// If we didn't hit the limit, we got all PRs within the period - done!
 	if !hitLimit {
-		return recent, queryHash, nil
+		return recent, nil
 	}
 
 	// Hit limit - need more coverage for earlier periods
 	// Query 2: Old activity (updated asc) - get ~500 more
-	old, _, _, err := fetchPRsFromOrgWithSort(ctx, orgSortParams{
+	old, _, err := fetchPRsFromOrgWithSort(ctx, orgSortParams{
 		org: org, sinceStr: sinceStr, token: token,
 		field: "updated", direction: "asc", maxPRs: 500, queryName: "old", progress: progress,
 	})
 	if err != nil {
 		slog.Warn("Failed to fetch old PRs from org, falling back to recent only", "error", err)
-		return recent, queryHash, nil
+		return recent, nil
 	}
 
 	slog.Info("Fetched old PRs from org",
@@ -467,24 +606,24 @@ func FetchPRsFromOrg(ctx context.Context, org string, since time.Time, token str
 			slog.Info("Gap > 1 week detected, fetching early period PRs to fill coverage hole (org)")
 
 			// Query 3: Early period (created asc) - get ~250 more
-			early, _, _, err := fetchPRsFromOrgWithSort(ctx, orgSortParams{
+			early, _, err := fetchPRsFromOrgWithSort(ctx, orgSortParams{
 				org: org, sinceStr: sinceStr, token: token,
 				field: "created", direction: "asc", maxPRs: 250, queryName: "early", progress: progress,
 			})
 			if err != nil {
 				slog.Warn("Failed to fetch early PRs from org, proceeding with recent+old", "error", err)
-				return deduplicatePRsByOwnerRepoNumber(append(recent, old...)), queryHash, nil
+				return deduplicatePRsByOwnerRepoNumber(append(recent, old...)), nil
 			}
 
 			slog.Info("Fetched early PRs from org",
 				"count", len(early))
 
-			return deduplicatePRsByOwnerRepoNumber(append(append(recent, old...), early...)), queryHash, nil
+			return deduplicatePRsByOwnerRepoNumber(append(append(recent, old...), early...)), nil
 		}
 	}
 
 	// Gap <= 1 week or no gap to check - merge recent + old
-	return deduplicatePRsByOwnerRepoNumber(append(recent, old...)), queryHash, nil
+	return deduplicatePRsByOwnerRepoNumber(append(recent, old...)), nil
 }
 
 // orgSortParams contains parameters for sorted org PR queries.
@@ -501,7 +640,9 @@ type orgSortParams struct {
 
 // fetchPRsFromOrgWithSort queries GitHub Search API with configurable sort order.
 // Returns PRs, a boolean indicating if the API limit (1000) was hit, and a query hash for caching.
-func fetchPRsFromOrgWithSort(ctx context.Context, params orgSortParams) ([]PRSummary, bool, string, error) {
+func fetchPRsFromOrgWithSort(
+	ctx context.Context, params orgSortParams,
+) (prs []PRSummary, hitLimit bool, err error) {
 	org, sinceStr := params.org, params.sinceStr
 	token := params.token
 	field, direction := params.field, params.direction
@@ -542,13 +683,10 @@ func fetchPRsFromOrgWithSort(ctx context.Context, params orgSortParams) ([]PRSum
 		}
 	}`
 
-	// Compute hash from the query template to detect structural changes
-	queryHash := QueryHash(queryTemplate)
-
 	var allPRs []PRSummary
 	var cursor *string
 	pageNum := 0
-	hitLimit := false
+	hitLimit = false
 
 	for {
 		pageNum++
@@ -567,13 +705,13 @@ func fetchPRsFromOrgWithSort(ctx context.Context, params orgSortParams) ([]PRSum
 
 		bodyBytes, err := json.Marshal(requestBody)
 		if err != nil {
-			return nil, false, "", fmt.Errorf("failed to marshal request: %w", err)
+			return nil, false, fmt.Errorf("failed to marshal request: %w", err)
 		}
 
 		// Make GraphQL request
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.github.com/graphql", bytes.NewReader(bodyBytes))
 		if err != nil {
-			return nil, false, "", fmt.Errorf("failed to create request: %w", err)
+			return nil, false, fmt.Errorf("failed to create request: %w", err)
 		}
 
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -581,7 +719,7 @@ func fetchPRsFromOrgWithSort(ctx context.Context, params orgSortParams) ([]PRSum
 
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
-			return nil, false, "", fmt.Errorf("failed to execute request: %w", err)
+			return nil, false, fmt.Errorf("failed to execute request: %w", err)
 		}
 		//nolint:revive,gocritic // defer-in-loop: proper HTTP response cleanup pattern
 		defer func() {
@@ -591,7 +729,7 @@ func fetchPRsFromOrgWithSort(ctx context.Context, params orgSortParams) ([]PRSum
 		}()
 
 		if resp.StatusCode != http.StatusOK {
-			return nil, false, "", fmt.Errorf("GraphQL request failed with status %d", resp.StatusCode)
+			return nil, false, fmt.Errorf("GraphQL request failed with status %d", resp.StatusCode)
 		}
 
 		// Parse response
@@ -628,11 +766,11 @@ func fetchPRsFromOrgWithSort(ctx context.Context, params orgSortParams) ([]PRSum
 		}
 
 		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			return nil, false, "", fmt.Errorf("failed to decode response: %w", err)
+			return nil, false, fmt.Errorf("failed to decode response: %w", err)
 		}
 
 		if len(result.Errors) > 0 {
-			return nil, false, "", fmt.Errorf("GraphQL error: %s", result.Errors[0].Message)
+			return nil, false, fmt.Errorf("GraphQL error: %s", result.Errors[0].Message)
 		}
 
 		totalCount := result.Data.Search.IssueCount
@@ -669,7 +807,7 @@ func fetchPRsFromOrgWithSort(ctx context.Context, params orgSortParams) ([]PRSum
 					"max_prs", maxPRs,
 					"field", field,
 					"direction", direction)
-				return allPRs, hitLimit, queryHash, nil
+				return allPRs, hitLimit, nil
 			}
 		}
 
@@ -685,7 +823,7 @@ func fetchPRsFromOrgWithSort(ctx context.Context, params orgSortParams) ([]PRSum
 		cursor = &result.Data.Search.PageInfo.EndCursor
 	}
 
-	return allPRs, hitLimit, queryHash, nil
+	return allPRs, hitLimit, nil
 }
 
 // deduplicatePRsByOwnerRepoNumber removes duplicate PRs from a slice using owner+repo+number as key.
@@ -875,18 +1013,37 @@ func CalculateActualTimeWindow(prs []PRSummary, requestedDays int) (actualDays i
 	return requestedDays, false
 }
 
-// CountOpenPRsInRepo queries GitHub GraphQL API to get the total count of open PRs in a repository
-// that were created more than 24 hours ago (PRs open <24 hours don't count as tracking overhead yet).
-//
-// Parameters:
-//   - ctx: Context for the API call
-//   - owner: GitHub repository owner
-//   - repo: GitHub repository name
-//   - token: GitHub authentication token
-//
-// Returns:
-//   - count: Number of open PRs created >24 hours ago
-func CountOpenPRsInRepo(ctx context.Context, owner, repo, token string) (int, error) {
+// CountOpenPRsInRepo queries GitHub GraphQL API (with caching) to get the total count
+// of open PRs in a repository that were created more than 24 hours ago.
+func (c *Client) CountOpenPRsInRepo(ctx context.Context, owner, repo, token string) (int, error) {
+	queryTemplate := `query($searchQuery: String!) {
+		search(query: $searchQuery, type: ISSUE, first: 0) {
+			issueCount
+		}
+	}`
+
+	cacheKey := CacheKey(queryTemplate, "owner", owner, "repo", repo)
+
+	// Check cache
+	if cached, found := c.cache.Get(ctx, cacheKey); found {
+		if count, ok := cached.(int); ok {
+			return count, nil
+		}
+	}
+
+	// Cache miss - fetch from GitHub
+	count, err := countOpenPRsInRepo(ctx, owner, repo, token)
+	if err != nil {
+		return 0, err
+	}
+
+	// Store in cache
+	c.cache.Set(ctx, cacheKey, count)
+	return count, nil
+}
+
+// countOpenPRsInRepo is the internal implementation (lowercase = package-private).
+func countOpenPRsInRepo(ctx context.Context, owner, repo, token string) (int, error) {
 	// Only count PRs created more than 24 hours ago
 	// Use search API which supports created date filtering
 	twentyFourHoursAgo := time.Now().Add(-24 * time.Hour).Format("2006-01-02T15:04:05Z")
@@ -965,10 +1122,38 @@ func CountOpenPRsInRepo(ctx context.Context, owner, repo, token string) (int, er
 	return count, nil
 }
 
-// CountOpenPRsInOrg counts all open PRs across an entire GitHub organization with a single GraphQL query.
-// This is much more efficient than counting PRs repo-by-repo for organizations with many repositories.
-// Only counts PRs created more than 24 hours ago to exclude brand-new PRs.
-func CountOpenPRsInOrg(ctx context.Context, org, token string) (int, error) {
+// CountOpenPRsInOrg queries GitHub GraphQL API (with caching) to count all open PRs
+// across an entire organization. More efficient than counting repo-by-repo.
+// Only counts PRs created more than 24 hours ago.
+func (c *Client) CountOpenPRsInOrg(ctx context.Context, org, token string) (int, error) {
+	queryTemplate := `query($searchQuery: String!) {
+		search(query: $searchQuery, type: ISSUE, first: 0) {
+			issueCount
+		}
+	}`
+
+	cacheKey := CacheKey(queryTemplate, "org", org)
+
+	// Check cache
+	if cached, found := c.cache.Get(ctx, cacheKey); found {
+		if count, ok := cached.(int); ok {
+			return count, nil
+		}
+	}
+
+	// Cache miss - fetch from GitHub
+	count, err := countOpenPRsInOrg(ctx, org, token)
+	if err != nil {
+		return 0, err
+	}
+
+	// Store in cache
+	c.cache.Set(ctx, cacheKey, count)
+	return count, nil
+}
+
+// countOpenPRsInOrg is the internal implementation.
+func countOpenPRsInOrg(ctx context.Context, org, token string) (int, error) {
 	// Only count PRs created more than 24 hours ago
 	twentyFourHoursAgo := time.Now().Add(-24 * time.Hour).Format("2006-01-02T15:04:05Z")
 
@@ -1051,19 +1236,51 @@ type RepoVisibility struct {
 	IsPrivate bool
 }
 
-// FetchOrgRepositoriesWithActivity fetches all repositories in an organization
-// that had activity (pushes) in the specified time period, along with their privacy status.
-// This is useful for determining which repositories were analyzed and whether they're public or private.
-//
-// Parameters:
-//   - ctx: Context for the API call
-//   - org: GitHub organization name
-//   - since: Only include repos with activity after this time
-//   - token: GitHub authentication token
-//
-// Returns:
-//   - Map of repository name to RepoVisibility struct
-func FetchOrgRepositoriesWithActivity(ctx context.Context, org string, since time.Time, token string) (map[string]RepoVisibility, error) {
+// FetchOrgRepositoriesWithActivity queries GitHub GraphQL API (with caching) to fetch
+// all repositories in an organization that had activity in the specified time period,
+// along with their privacy status (public/private).
+func (c *Client) FetchOrgRepositoriesWithActivity(ctx context.Context, org string, since time.Time, token string) (map[string]RepoVisibility, error) {
+	queryTemplate := `
+		query($org: String!, $cursor: String) {
+			organization(login: $org) {
+				repositories(first: 100, after: $cursor, orderBy: {field: PUSHED_AT, direction: DESC}) {
+					pageInfo {
+						hasNextPage
+						endCursor
+					}
+					nodes {
+						name
+						isPrivate
+						pushedAt
+					}
+				}
+			}
+		}
+	`
+
+	days := int(time.Since(since).Hours() / 24)
+	cacheKey := CacheKey(queryTemplate, "org", org, "days", strconv.Itoa(days))
+
+	// Check cache
+	if cached, found := c.cache.Get(ctx, cacheKey); found {
+		if repoVis, ok := cached.(map[string]RepoVisibility); ok {
+			return repoVis, nil
+		}
+	}
+
+	// Cache miss - fetch from GitHub
+	repoVis, err := fetchOrgRepositoriesWithActivity(ctx, org, since, token)
+	if err != nil {
+		return nil, err
+	}
+
+	// Store in cache
+	c.cache.Set(ctx, cacheKey, repoVis)
+	return repoVis, nil
+}
+
+// fetchOrgRepositoriesWithActivity is the internal implementation.
+func fetchOrgRepositoriesWithActivity(ctx context.Context, org string, since time.Time, token string) (map[string]RepoVisibility, error) {
 	query := `
 		query($org: String!, $cursor: String) {
 			organization(login: $org) {
